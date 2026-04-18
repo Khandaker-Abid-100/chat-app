@@ -6,10 +6,9 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      "/ws": {
-        target: "ws://localhost:3001",
-        ws: true,
-      },
+      // "/ws": { target: "ws://localhost:3001", ws: true },
+    "/auth": { target: "http://localhost:3001" },
+    "/messages": { target: "http://localhost:3001" },
     },
   },
 })
