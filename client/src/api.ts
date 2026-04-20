@@ -1,4 +1,4 @@
-import type { MessagePayload, UserPayload } from "../../shared/types";
+import type { MessagePayload, RoomPayload, UserPayload } from "../../shared/types";
 
 export type AuthResponse = {
   token: string;
@@ -33,8 +33,48 @@ export async function apiLogin(
   return data as AuthResponse;
 }
 
-export async function apiGetMessages(token: string): Promise<MessagePayload[]> {
-  const res = await fetch("/messages", {
+export async function apiGetRooms(token: string): Promise<RoomPayload[]> {
+  const res = await fetch("/rooms", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? "Failed to load rooms.");
+  return data as RoomPayload[];
+}
+
+export async function apiCreateRoom(
+  token: string,
+  name: string
+): Promise<RoomPayload> {
+  const res = await fetch("/rooms", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ name }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? "Failed to create room.");
+  return data as RoomPayload;
+}
+
+export async function apiJoinRoom(token: string, roomId: string): Promise<void> {
+  const res = await fetch(`/rooms/${roomId}/join`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const data = await res.json();
+    throw new Error(data.error ?? "Failed to join room.");
+  }
+}
+
+export async function apiGetMessages(
+  token: string,
+  roomId: string
+): Promise<MessagePayload[]> {
+  const res = await fetch(`/rooms/${roomId}/messages`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   const data = await res.json();

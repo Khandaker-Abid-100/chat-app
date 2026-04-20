@@ -9,6 +9,7 @@ export default defineConfig({
       // "/ws": { target: "ws://localhost:3001", ws: true },
     "/auth": { target: "http://localhost:3001" },
     "/messages": { target: "http://localhost:3001" },
+     "/rooms": { target: "http://localhost:3001" },
     },
   },
 })

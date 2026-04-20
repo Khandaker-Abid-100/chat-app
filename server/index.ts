@@ -1,26 +1,44 @@
-import { sql, type ServerWebSocket } from "bun";
+import type { ServerWebSocket } from "bun";
 import { register, login, verifyToken } from "./auth";
 import {
   saveMessage,
-  getRecentMessages,
+  getMessagesByRoom,
   markMessagesRead,
   findUserById,
+  getAllRooms,
+  createRoom,
+  joinRoom,
+  findRoomById,
 } from "./db";
 import type { ClientMessage, ServerMessage } from "../shared/types";
 
 // ── Connected clients: userId → WebSocket ──
-// One user can only have one active connection at a time
 const clients = new Map<string, ServerWebSocket<{ userId: string }>>();
 
-// ── Broadcast a message to all connected clients ──
-function broadcast(msg: ServerMessage) {
+// ── Room presence: roomId → Set of userIds currently in that room ──
+const roomPresence = new Map<string, Set<string>>();
+
+// ── Broadcast to every user currently in a specific room ──
+function broadcastToRoom(roomId: string, msg: ServerMessage) {
+  const json = JSON.stringify(msg);
+  const members = roomPresence.get(roomId);
+  if (!members) return;
+  for (const userId of members) {
+    const ws = clients.get(userId);
+    if (ws) ws.send(json);
+  }
+}
+
+// ── Broadcast to every connected client ──
+function broadcastAll(msg: ServerMessage) {
   const json = JSON.stringify(msg);
   for (const ws of clients.values()) {
     ws.send(json);
   }
 }
 
-// ── Helper: parse JSON body from a Request ──
+
+// ── Parse JSON body from a Request ──
 async function parseBody<T>(req: Request): Promise<T> {
   try {
     return (await req.json()) as T;
@@ -29,21 +47,29 @@ async function parseBody<T>(req: Request): Promise<T> {
   }
 }
 
-// ── Helper: send a JSON response ──
+// ── Send a JSON HTTP response with CORS headers ──
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json", ...cors() },
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    },
   });
 }
 
-// ── Helper: CORS headers for local dev ──
-function cors(): HeadersInit {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  };
+// ── CORS preflight response ──
+function corsPreFlight(): Response {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    },
+  });
 }
 
 const server = Bun.serve<{ userId: string }>({
@@ -53,9 +79,9 @@ const server = Bun.serve<{ userId: string }>({
     const url = new URL(req.url);
     const method = req.method;
 
-    // Handle CORS preflight
+    // ── CORS preflight ──
     if (method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: cors() });
+      return corsPreFlight();
     }
 
     // ── POST /auth/register ──
@@ -86,45 +112,94 @@ const server = Bun.serve<{ userId: string }>({
       }
     }
 
-    // ── GET /messages — fetch recent chat history ──
-    if (method === "GET" && url.pathname === "/messages") {
-      const authHeader = req.headers.get("Authorization") ?? "";
-      const token = authHeader.replace("Bearer ", "");
-      const user = await verifyToken(token);
-      if (!user) return json({ error: "Unauthorized" }, 401);
-
-      const messages = await getRecentMessages(50);
-      return json(messages);
+    // ── WebSocket upgrade at /ws?token=... ──
+      if (url.pathname === "/ws") {
+      const wsToken = url.searchParams.get("token") ?? "";
+      try {
+        const user = await verifyToken(wsToken);
+        if (!user) {
+          console.error("WS upgrade rejected: invalid or missing token");
+          return json({ error: "Unauthorized" }, 401);
+        }
+        const upgraded = server.upgrade(req, {
+          data: { userId: user.id },
+          headers: { "Access-Control-Allow-Origin": "*" },
+        });
+        if (!upgraded) {
+          return new Response("WebSocket upgrade failed", { status: 400 });
+        }
+        return undefined;
+      } catch (err) {
+        console.error("WS upgrade error:", err);
+        return json({ error: "Internal server error" }, 500);
+      }
     }
 
-    // ── WebSocket upgrade at /ws?token=... ──
-    if (url.pathname === "/ws") {
-      const token = url.searchParams.get("token") ?? "";
-      const user = await verifyToken(token);
-      if (!user) return json({ error: "Unauthorized" }, 401);
+    // ── Authorization header guard for all HTTP routes below ──
+    const authHeader = req.headers.get("Authorization") ?? "";
+    const token = authHeader.replace("Bearer ", "");
+    const currentUser = await verifyToken(token);
+    if (!currentUser) {
+      return json({ error: "Unauthorized" }, 401);
+    }
 
-      const upgraded = server.upgrade(req, {
-        data: { userId: user.id },
-        headers: {
-      "Access-Control-Allow-Origin": "*",
-    },
-      });
-      if (!upgraded) return new Response("WebSocket upgrade failed", { status: 400 });
-      return undefined;
+    // ── GET /rooms — list all rooms with unread counts ──
+    if (method === "GET" && url.pathname === "/rooms") {
+      const rooms = await getAllRooms(currentUser.id);
+      return json(rooms);
+    }
+
+    // ── POST /rooms — create a new room ──
+    if (method === "POST" && url.pathname === "/rooms") {
+      try {
+        const { name } = await parseBody<{ name: string }>(req);
+        if (!name?.trim()) throw new Error("Room name is required.");
+        const room = await createRoom(name.trim());
+        // Creator automatically joins their own room
+        await joinRoom(room.id, currentUser.id);
+        // Broadcast room creation to all connected clients
+        broadcastAll({
+          type: "room_created",
+          room,
+        });
+        return json(room, 201);
+      } catch (err: any) {
+        return json({ error: err.message }, 400);
+      }
+    }
+
+    // ── POST /rooms/:id/join ──
+    const joinMatch = url.pathname.match(/^\/rooms\/([^/]+)\/join$/);
+    if (method === "POST" && joinMatch) {
+      const roomId = joinMatch[1];
+      if (!roomId) return json({ error: "Invalid room ID." }, 400);
+      const room = await findRoomById(roomId);
+      if (!room) return json({ error: "Room not found." }, 404);
+      await joinRoom(roomId, currentUser.id);
+      return json({ ok: true });
+    }
+
+    // ── GET /rooms/:id/messages ──
+    const messagesMatch = url.pathname.match(/^\/rooms\/([^/]+)\/messages$/);
+    if (method === "GET" && messagesMatch) {
+      const roomId = messagesMatch[1];
+      if (!roomId) return json({ error: "Invalid room ID." }, 400);
+      const messages = await getMessagesByRoom(roomId, 50);
+      return json(messages);
     }
 
     return json({ error: "Not found" }, 404);
   },
 
   websocket: {
-    // ── A user connected ──
+    // ── User connected ──
     async open(ws) {
       const { userId } = ws.data;
       clients.set(userId, ws);
       console.log(`+ connected userId=${userId}. Online: ${clients.size}`);
     },
 
-    // ── A user sent a message ──
+    // ── User sent a message ──
     async message(ws, raw) {
       const { userId } = ws.data;
       let msg: ClientMessage;
@@ -132,25 +207,54 @@ const server = Bun.serve<{ userId: string }>({
       try {
         msg = JSON.parse(raw as string) as ClientMessage;
       } catch {
-        ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" } satisfies ServerMessage));
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Invalid JSON",
+          } satisfies ServerMessage)
+        );
         return;
       }
 
+      // ── join_room: user opened a room ──
+      if (msg.type === "join_room") {
+        const { roomId } = msg;
+
+        // Record DB membership
+        await joinRoom(roomId, userId);
+
+        // Track live presence
+        if (!roomPresence.has(roomId)) {
+          roomPresence.set(roomId, new Set());
+        }
+        roomPresence.get(roomId)!.add(userId);
+
+        console.log(`  userId=${userId} joined roomId=${roomId}`);
+        return;
+      }
+
+      // ── send_message: user sent a chat message ──
       if (msg.type === "send_message") {
-        if (!msg.content?.trim()) return;
+        const { roomId, content } = msg;
+        if (!content?.trim()) return;
 
-        // Save to DB
-        const { id: messageId } = await saveMessage(userId, msg.content.trim());
+        // Persist to database
+        const { id: messageId } = await saveMessage(
+          roomId,
+          userId,
+          content.trim()
+        );
 
-        // Fetch the saved message with sender info to broadcast
+        // Fetch sender info for the broadcast payload
         const user = await findUserById(userId);
         if (!user) return;
 
-        const serverMsg: ServerMessage = {
+        const outgoing: ServerMessage = {
           type: "new_message",
           message: {
             id: messageId,
-            content: msg.content.trim(),
+            roomId,
+            content: content.trim(),
             senderId: userId,
             senderName: user.username,
             createdAt: new Date().toISOString(),
@@ -158,30 +262,39 @@ const server = Bun.serve<{ userId: string }>({
           },
         };
 
-        broadcast(serverMsg);
+        // Send only to users currently in this room
+        broadcastToRoom(roomId, outgoing);
         return;
       }
 
+      // ── mark_read: user has seen messages up to lastMessageId ──
       if (msg.type === "mark_read") {
-        if (!msg.lastMessageId) return;
+        const { roomId, lastMessageId } = msg;
+        if (!lastMessageId) return;
 
-        const seenBy = await markMessagesRead(userId, msg.lastMessageId);
+        const seenBy = await markMessagesRead(userId, roomId, lastMessageId);
 
-        // Notify all clients that someone has seen up to this message
         const update: ServerMessage = {
           type: "seen_update",
-          messageId: msg.lastMessageId,
+          messageId: lastMessageId,
           seenBy,
         };
-        broadcast(update);
+
+        broadcastToRoom(roomId, update);
         return;
       }
     },
 
-    // ── A user disconnected ──
+    // ── User disconnected ──
     close(ws) {
       const { userId } = ws.data;
       clients.delete(userId);
+
+      // Remove from all room presence sets
+      for (const members of roomPresence.values()) {
+        members.delete(userId);
+      }
+
       console.log(`- disconnected userId=${userId}. Online: ${clients.size}`);
     },
   },
