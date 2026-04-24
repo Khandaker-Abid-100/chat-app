@@ -1,5 +1,10 @@
 import { sql } from "bun";
-import type { MessagePayload, RoomPayload, UserPayload } from "../shared/types";
+import type {
+  MessagePayload,
+  RoomPayload,
+  UserPayload,
+  InvitationPayload,
+} from "../shared/types";
 
 // ── Users ──
 
@@ -34,15 +39,38 @@ export async function findUserById(id: string): Promise<UserPayload | null> {
   return (rows[0] as UserPayload) ?? null;
 }
 
+export async function searchUsersByUsername(
+  query: string,
+  excludeUserId: string
+): Promise<UserPayload[]> {
+  const rows = await sql`
+    SELECT id, username FROM users
+    WHERE username ILIKE ${"%" + query + "%"}
+      AND id != ${excludeUserId}
+    LIMIT 10
+  `;
+  return rows as UserPayload[];
+}
+
 // ── Rooms ──
 
-export async function getAllRooms(userId: string): Promise<RoomPayload[]> {
-  // Get all rooms with unread count for this user
+export async function getAllRoomsForUser(userId: string): Promise<RoomPayload[]> {
+  // Only return rooms the user is a member of
   const rows = await sql`
     SELECT
       r.id,
       r.name,
-      r.created_at AS "createdAt",
+      r.invite_code  AS "inviteCode",
+      r.created_at   AS "createdAt",
+      -- is this user the creator (first member joined)?
+      EXISTS (
+        SELECT 1 FROM room_members rm2
+        WHERE rm2.room_id = r.id
+          AND rm2.user_id = ${userId}
+          AND rm2.joined_at = (
+            SELECT MIN(joined_at) FROM room_members WHERE room_id = r.id
+          )
+      ) AS "isOwner",
       COUNT(m.id) FILTER (
         WHERE m.id NOT IN (
           SELECT message_id FROM message_reads WHERE user_id = ${userId}
@@ -50,6 +78,7 @@ export async function getAllRooms(userId: string): Promise<RoomPayload[]> {
         AND m.sender_id != ${userId}
       ) AS "unreadCount"
     FROM rooms r
+    INNER JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = ${userId}
     LEFT JOIN messages m ON m.room_id = r.id
     GROUP BY r.id
     ORDER BY r.created_at ASC
@@ -60,16 +89,94 @@ export async function getAllRooms(userId: string): Promise<RoomPayload[]> {
   })) as RoomPayload[];
 }
 
-export async function createRoom(name: string): Promise<RoomPayload> {
+export async function createRoom(
+  name: string,
+  creatorId: string
+): Promise<RoomPayload> {
+  // Generate a unique 6-character invite code
+  const inviteCode = Math.random().toString(36).slice(2, 8).toUpperCase();
+
   const rows = await sql`
-    INSERT INTO rooms (name)
-    VALUES (${name})
-    RETURNING id, name, created_at AS "createdAt"
+    INSERT INTO rooms (name, invite_code)
+    VALUES (${name}, ${inviteCode})
+    RETURNING id, name, invite_code AS "inviteCode", created_at AS "createdAt"
   `;
+
+  const room = rows[0] as RoomPayload & { inviteCode: string };
+
+  // Creator automatically becomes first member
+  await sql`
+    INSERT INTO room_members (room_id, user_id)
+    VALUES (${room.id}, ${creatorId})
+  `;
+
+  return { ...room, unreadCount: 0, isOwner: true };
+}
+
+export async function findRoomById(roomId: string): Promise<RoomPayload | null> {
+  const rows = await sql`
+    SELECT id, name, invite_code AS "inviteCode", created_at AS "createdAt"
+    FROM rooms WHERE id = ${roomId} LIMIT 1
+  `;
+  if (!rows[0]) return null;
   return { ...(rows[0] as any), unreadCount: 0 } as RoomPayload;
 }
 
-export async function joinRoom(roomId: string, userId: string): Promise<void> {
+export async function findRoomByInviteCode(
+  code: string
+): Promise<RoomPayload | null> {
+  const rows = await sql`
+    SELECT id, name, invite_code AS "inviteCode", created_at AS "createdAt"
+    FROM rooms
+    WHERE invite_code = ${code.toUpperCase()}
+    LIMIT 1
+  `;
+  if (!rows[0]) return null;
+  return { ...(rows[0] as any), unreadCount: 0 } as RoomPayload;
+}
+
+export async function regenerateInviteCode(
+  roomId: string
+): Promise<string> {
+  const newCode = Math.random().toString(36).slice(2, 8).toUpperCase();
+  await sql`
+    UPDATE rooms SET invite_code = ${newCode} WHERE id = ${roomId}
+  `;
+  return newCode;
+}
+
+// ── Room membership ──
+
+export async function checkRoomMembership(
+  roomId: string,
+  userId: string
+): Promise<boolean> {
+  const rows = await sql`
+    SELECT 1 FROM room_members
+    WHERE room_id = ${roomId} AND user_id = ${userId}
+    LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
+export async function isRoomOwner(
+  roomId: string,
+  userId: string
+): Promise<boolean> {
+  // Owner is the user with the earliest joined_at in this room
+  const rows = await sql`
+    SELECT user_id FROM room_members
+    WHERE room_id = ${roomId}
+    ORDER BY joined_at ASC
+    LIMIT 1
+  `;
+  return rows.length > 0 && (rows[0] as any).user_id === userId;
+}
+
+export async function joinRoomById(
+  roomId: string,
+  userId: string
+): Promise<void> {
   await sql`
     INSERT INTO room_members (room_id, user_id)
     VALUES (${roomId}, ${userId})
@@ -77,13 +184,104 @@ export async function joinRoom(roomId: string, userId: string): Promise<void> {
   `;
 }
 
-export async function findRoomById(roomId: string): Promise<RoomPayload | null> {
+export async function joinRoomByCode(
+  code: string,
+  userId: string
+): Promise<RoomPayload | null> {
+  const room = await findRoomByInviteCode(code);
+  if (!room) return null;
+  await joinRoomById(room.id, userId);
+  return room;
+}
+
+export async function getRoomMembers(roomId: string): Promise<UserPayload[]> {
   const rows = await sql`
-    SELECT id, name, created_at AS "createdAt"
-    FROM rooms WHERE id = ${roomId} LIMIT 1
+    SELECT u.id, u.username
+    FROM room_members rm
+    JOIN users u ON u.id = rm.user_id
+    WHERE rm.room_id = ${roomId}
+    ORDER BY rm.joined_at ASC
   `;
+  return rows as UserPayload[];
+}
+
+// ── Invitations ──
+
+export async function createInvitation(
+  roomId: string,
+  invitedBy: string,
+  invitedUsername: string
+): Promise<void> {
+  // Check the user exists
+  const user = await findUserByUsername(invitedUsername);
+  if (!user) throw new Error(`User "${invitedUsername}" not found.`);
+
+  // Check they are not already a member
+  const alreadyMember = await checkRoomMembership(roomId, user.id);
+  if (alreadyMember) throw new Error(`${invitedUsername} is already in this room.`);
+
+  await sql`
+    INSERT INTO invitations (room_id, invited_by, invited_username)
+    VALUES (${roomId}, ${invitedBy}, ${invitedUsername})
+    ON CONFLICT DO NOTHING
+  `;
+}
+
+export async function getPendingInvitations(
+  username: string
+): Promise<InvitationPayload[]> {
+  const rows = await sql`
+    SELECT
+      i.id,
+      i.room_id       AS "roomId",
+      r.name          AS "roomName",
+      u.username      AS "invitedBy",
+      i.created_at    AS "createdAt",
+      i.accepted
+    FROM invitations i
+    JOIN rooms r ON r.id = i.room_id
+    JOIN users u ON u.id = i.invited_by
+    WHERE i.invited_username = ${username}
+      AND i.accepted = FALSE
+    ORDER BY i.created_at DESC
+  `;
+  return rows as InvitationPayload[];
+}
+
+export async function acceptInvitation(
+  invitationId: string,
+  username: string
+): Promise<RoomPayload | null> {
+  const rows = await sql`
+    SELECT i.room_id, i.invited_username
+    FROM invitations i
+    WHERE i.id = ${invitationId}
+      AND i.invited_username = ${username}
+      AND i.accepted = FALSE
+    LIMIT 1
+  `;
+
   if (!rows[0]) return null;
-  return { ...(rows[0] as any), unreadCount: 0 } as RoomPayload;
+
+  const { room_id: roomId } = rows[0] as { room_id: string };
+
+  // Get the user id
+  const user = await findUserByUsername(username);
+  if (!user) return null;
+
+  // Add to room members and mark invitation accepted in a transaction
+  await sql.begin(async (tx) => {
+    await tx`
+      INSERT INTO room_members (room_id, user_id)
+      VALUES (${roomId}, ${user.id})
+      ON CONFLICT DO NOTHING
+    `;
+    await tx`
+      UPDATE invitations SET accepted = TRUE WHERE id = ${invitationId}
+    `;
+  });
+
+  return findRoomById(roomId);
 }
 
 // ── Messages ──
@@ -129,14 +327,11 @@ export async function getMessagesByRoom(
   return rows as MessagePayload[];
 }
 
-// ── Mark messages as read ──
-
 export async function markMessagesRead(
   userId: string,
   roomId: string,
   lastMessageId: string
 ): Promise<string[]> {
-  // Mark all messages in this room up to lastMessageId as read
   await sql`
     INSERT INTO message_reads (message_id, user_id)
     SELECT m.id, ${userId}
@@ -148,7 +343,6 @@ export async function markMessagesRead(
     ON CONFLICT DO NOTHING
   `;
 
-  // Return usernames who have seen this specific message
   const rows = await sql`
     SELECT u.username
     FROM message_reads mr

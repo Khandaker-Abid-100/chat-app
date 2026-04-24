@@ -8,8 +8,10 @@ export default defineConfig({
     proxy: {
       // "/ws": { target: "ws://localhost:3001", ws: true },
     "/auth": { target: "http://localhost:3001" },
-    "/messages": { target: "http://localhost:3001" },
+    // "/messages": { target: "http://localhost:3001" },
      "/rooms": { target: "http://localhost:3001" },
+     "/invitations": { target: "http://localhost:3001" },
+      "/users": { target: "http://localhost:3001" },
     },
   },
 })

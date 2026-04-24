@@ -1,14 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { useAuth } from "../context/useAuth";
-import { apiGetMessages } from "../api";
-import MessageList from "../MessageList";
+import { useWs } from "../context/useWs";
+import { useMessages } from "../hooks/useMessages";
+import MessageList from "../MessageList.tsx";
 import ChatBox from "../ChatBox";
-import type {
-  ClientMessage,
-  MessagePayload,
-  RoomPayload,
-  ServerMessage,
-} from "../../../shared/types";
+import type { ClientMessage, RoomPayload } from "../../../shared/types";
 
 type Props = {
   room: RoomPayload;
@@ -17,85 +13,46 @@ type Props = {
 
 export default function ChatPage({ room, onBack }: Props) {
   const { auth } = useAuth();
-  const [messages, setMessages] = useState<MessagePayload[]>([]);
-  const [connected, setConnected] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
+  const { connected, send, lastMessage } = useWs();
+  const { messages } = useMessages(
+    auth?.token ?? null,
+    room.id,
+    lastMessage
+  );
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
+  // Auto-scroll to newest message
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Tell the server we joined this room when the page opens
   useEffect(() => {
-    if (!auth) return;
-
-    // Load message history for this room
-    apiGetMessages(auth.token, room.id)
-      .then(setMessages)
-      .catch(console.error);
-
-    const ws = new WebSocket(`ws://localhost:3001/ws?token=${auth.token}`);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setConnected(true);
-      // Tell server we joined this room
-      const joinMsg: ClientMessage = { type: "join_room", roomId: room.id };
-      ws.send(JSON.stringify(joinMsg));
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data as string) as ServerMessage;
-
-        if (msg.type === "new_message" && msg.message.roomId === room.id) {
-          setMessages((prev) => [...prev, msg.message]);
-        }
-
-        if (msg.type === "seen_update") {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === msg.messageId ? { ...m, seenBy: msg.seenBy } : m
-            )
-          );
-        }
-      } catch (err) {
-        console.error("Failed to parse WS message:", err);
-      }
-    };
-
-    ws.onerror = (err) => console.error("WebSocket error:", err);
-    ws.onclose = () => setConnected(false);
-
-    return () => ws.close();
-  }, [auth, room.id]);
+    if (!connected) return;
+    const msg: ClientMessage = { type: "join_room", roomId: room.id };
+    send(msg);
+  }, [connected, room.id]);
 
   function sendMessage(content: string) {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const msg: ClientMessage = {
       type: "send_message",
       roomId: room.id,
       content,
     };
-    ws.send(JSON.stringify(msg));
+    send(msg);
   }
 
   function markRead(lastMessageId: string) {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const msg: ClientMessage = {
       type: "mark_read",
       roomId: room.id,
       lastMessageId,
     };
-    ws.send(JSON.stringify(msg));
+    send(msg);
   }
 
   return (
     <div className="flex flex-col h-screen bg-gray-50">
-
-      {/* Header */}
       <div className="flex items-center gap-3 px-4 py-4 bg-white border-b border-gray-200 shadow-sm">
         <button
           onClick={onBack}
@@ -117,15 +74,12 @@ export default function ChatPage({ room, onBack }: Props) {
         </div>
       </div>
 
-      {/* Messages */}
       <MessageList
         messages={messages}
         myId={auth?.user.id ?? ""}
         onMessageVisible={markRead}
       />
       <div ref={bottomRef} />
-
-      {/* Input */}
       <ChatBox onSend={sendMessage} />
     </div>
   );
