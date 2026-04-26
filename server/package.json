@@ -17,7 +17,10 @@
     "typescript": "^5"
   },
   "scripts": {
-    "dev": "bun run --watch index.ts", 
+    "dev": "bun run --watch index.ts",
     "migrate": "bun run migrate.ts"
+  },
+  "dependencies": {
+    "ioredis": "^5.10.1"
   }
 }

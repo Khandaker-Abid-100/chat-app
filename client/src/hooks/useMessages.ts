@@ -1,51 +1,105 @@
-import { useEffect, useReducer } from "react";
+import { useEffect, useReducer, useCallback } from "react";
 import { apiGetMessages } from "../api";
 import type { MessagePayload, ServerMessage } from "../../../shared/types";
 
-type State = MessagePayload[];
+type State = {
+  messages: MessagePayload[];
+  nextCursor: string | null;
+  loadingMore: boolean;
+  hasMore: boolean;
+};
 
 type Action =
-  | { type: "SET"; messages: MessagePayload[] }
+  | { type: "SET_INITIAL"; messages: MessagePayload[]; nextCursor: string | null }
+  | { type: "PREPEND"; messages: MessagePayload[]; nextCursor: string | null }
   | { type: "APPEND"; message: MessagePayload }
-  | { type: "UPDATE_SEEN"; messageId: string; seenBy: string[] };
+  | { type: "UPDATE_SEEN"; messageId: string; seenBy: string[] }
+  | { type: "SET_LOADING_MORE"; value: boolean }
+  | { type: "RESET" };
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
-    case "SET":
-      return action.messages;
+    case "SET_INITIAL":
+      return {
+        messages: action.messages,
+        nextCursor: action.nextCursor,
+        hasMore: action.nextCursor !== null,
+        loadingMore: false,
+      };
+
+    case "PREPEND":
+      // Older messages loaded via infinite scroll — add to top
+      return {
+        ...state,
+        messages: [...action.messages, ...state.messages],
+        nextCursor: action.nextCursor,
+        hasMore: action.nextCursor !== null,
+        loadingMore: false,
+      };
+
     case "APPEND":
-      return [...state, action.message];
+      return {
+        ...state,
+        messages: [...state.messages, action.message],
+      };
+
     case "UPDATE_SEEN":
-      return state.map((m) =>
-        m.id === action.messageId ? { ...m, seenBy: action.seenBy } : m
-      );
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.id === action.messageId
+            ? { ...m, seenBy: action.seenBy }
+            : m
+        ),
+      };
+
+    case "SET_LOADING_MORE":
+      return { ...state, loadingMore: action.value };
+
+    case "RESET":
+      return {
+        messages: [],
+        nextCursor: null,
+        hasMore: false,
+        loadingMore: false,
+      };
+
     default:
       return state;
   }
 }
+
+const initialState: State = {
+  messages: [],
+  nextCursor: null,
+  hasMore: false,
+  loadingMore: false,
+};
 
 export function useMessages(
   token: string | null,
   roomId: string,
   wsMessage: ServerMessage | null
 ) {
-  const [messages, dispatch] = useReducer(reducer, []);
+  const [state, dispatch] = useReducer(reducer, initialState);
 
-  // Load history when entering a room
+  // Load most recent messages when entering a room
   useEffect(() => {
     if (!token || !roomId) return;
 
     let cancelled = false;
 
     apiGetMessages(token, roomId)
-      .then((msgs) => {
-        if (!cancelled) dispatch({ type: "SET", messages: msgs });
+      .then(({ messages, nextCursor }) => {
+        if (!cancelled) {
+          dispatch({ type: "SET_INITIAL", messages, nextCursor });
+        }
       })
       .catch(console.error);
 
     return () => {
       cancelled = true;
-      dispatch({ type: "SET", messages: [] });
+      dispatch({ type: "RESET" });
     };
   }, [token, roomId]);
 
@@ -69,5 +123,29 @@ export function useMessages(
     }
   }, [wsMessage, roomId]);
 
-  return { messages };
+  // Load older messages — called when user scrolls to the top
+  const loadMore = useCallback(async () => {
+    if (!token || !state.nextCursor || state.loadingMore) return;
+
+    dispatch({ type: "SET_LOADING_MORE", value: true });
+
+    try {
+      const { messages, nextCursor } = await apiGetMessages(
+        token,
+        roomId,
+        state.nextCursor
+      );
+      dispatch({ type: "PREPEND", messages, nextCursor });
+    } catch (err) {
+      console.error("Failed to load more messages:", err);
+      dispatch({ type: "SET_LOADING_MORE", value: false });
+    }
+  }, [token, roomId, state.nextCursor, state.loadingMore]);
+
+  return {
+    messages: state.messages,
+    hasMore: state.hasMore,
+    loadingMore: state.loadingMore,
+    loadMore,
+  };
 }

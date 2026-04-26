@@ -84,14 +84,19 @@ export async function apiJoinByCode(
 
 export async function apiGetMessages(
   token: string,
-  roomId: string
-): Promise<MessagePayload[]> {
-  const res = await fetch(`/rooms/${roomId}/messages`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  roomId: string,
+  beforeCursor?: string
+): Promise<{ messages: MessagePayload[]; nextCursor: string | null }> {
+  const params = new URLSearchParams();
+  if (beforeCursor) params.set("before", beforeCursor);
+
+  const res = await fetch(
+    `/rooms/${roomId}/messages${beforeCursor ? `?${params}` : ""}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
   const data = await res.json();
   if (!res.ok) throw new Error(data.error ?? "Failed to load messages.");
-  return data as MessagePayload[];
+  return data as { messages: MessagePayload[]; nextCursor: string | null };
 }
 
 export async function apiGetMembers(

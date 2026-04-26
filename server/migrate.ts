@@ -29,8 +29,6 @@ async function migrate() {
     }
 
     // Read and run the SQL file
-    // sql.unsafe is used here because this is trusted internal content
-    // (our own migration files), never user input
     const filePath = join(migrationsDir, filename);
     const migrationSQL = readFileSync(filePath, "utf8");
     await sql.unsafe(migrationSQL);

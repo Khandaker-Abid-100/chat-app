@@ -14,6 +14,10 @@ import {
   handleSearchUsers,
 } from "./routes/rooms";
 import { handleOpen, handleMessage, handleClose } from "./routes/ws";
+import { initRedisSubscriber } from "./services/broadcast";
+
+// Start Redis subscription listener before accepting connections
+initRedisSubscriber();
 
 function json(data: unknown, status = 200, req?: Request): Response {
   return new Response(JSON.stringify(data), {

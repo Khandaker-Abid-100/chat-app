@@ -1,9 +1,7 @@
 import {
   getAllRoomsForUser,
   createRoom,
-  findRoomByInviteCode,
   joinRoomByCode,
-  joinRoomById,
   checkRoomMembership,
   isRoomOwner,
   getMessagesByRoom,
@@ -17,6 +15,7 @@ import {
 import { corsHeaders } from "../middleware/cors";
 import { broadcastAll } from "../services/broadcast";
 import type { ServerMessage } from "../../shared/types";
+import { getUnreadCounts } from "../services/unreadCounter";
 
 function json(data: unknown, status = 200, req?: Request): Response {
   return new Response(JSON.stringify(data), {
@@ -42,9 +41,18 @@ export async function handleGetRooms(
   userId: string
 ): Promise<Response> {
   const rooms = await getAllRoomsForUser(userId);
-  return json(rooms, 200, req);
-}
+  const roomIds = rooms.map((r) => r.id);
 
+  // Fetch all unread counts in a single Redis pipeline call
+  const unreadCounts = await getUnreadCounts(userId, roomIds);
+
+  const result = rooms.map((r) => ({
+    ...r,
+    unreadCount: unreadCounts[r.id] ?? 0,
+  }));
+
+  return json(result, 200, req);
+}
 // ── POST /rooms — create room, creator auto-joined ──
 export async function handleCreateRoom(
   req: Request,
@@ -56,7 +64,7 @@ export async function handleCreateRoom(
     const room = await createRoom(name.trim(), userId);
 
     const msg: ServerMessage = { type: "room_created", room };
-    broadcastAll(msg);
+    await broadcastAll(msg);
 
     return json(room, 201, req);
   } catch (err: any) {
@@ -157,8 +165,17 @@ export async function handleGetMessages(
   if (!isMember) {
     return json({ error: "You are not a member of this room." }, 403, req);
   }
-  const messages = await getMessagesByRoom(roomId, 50);
-  return json(messages, 200, req);
+
+  const url = new URL(req.url);
+  // Client sends ?before=<timestamp> to load older messages
+  const beforeCursor = url.searchParams.get("before") ?? undefined;
+  const limit = Math.min(
+    parseInt(url.searchParams.get("limit") ?? "50", 10),
+    100 // hard cap — never return more than 100 at once
+  );
+
+  const result = await getMessagesByRoom(roomId, limit, beforeCursor);
+  return json(result, 200, req);
 }
 
 // ── GET /users/search?q=... — search users to invite ──

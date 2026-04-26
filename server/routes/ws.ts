@@ -5,30 +5,31 @@ import {
   findUserById,
   joinRoomById,
   markMessagesRead,
+  getRoomMemberIds,
 } from "../db";
 import {
   clients,
-  roomPresence,
   broadcastToRoom,
   addToRoom,
   removeFromAllRooms,
+  subscribeToRoom,
 } from "../services/broadcast";
+import {
+  incrementUnreadForRoom,
+  clearUnread,
+} from "../services/unreadCounter";
 import type { ClientMessage, ServerMessage } from "../../shared/types";
 
-// Pending sockets waiting for auth message
-// ws → timeout handle
 const pendingClients = new Map<
   ServerWebSocket<{ userId: string }>,
   ReturnType<typeof setTimeout>
 >();
 
 export function handleOpen(ws: ServerWebSocket<{ userId: string }>): void {
-  // Give the client 10 seconds to send an auth message
   const timeout = setTimeout(() => {
     console.warn("WS closed: no auth message received within 10s");
     ws.close(4001, "Authentication timeout");
   }, 10_000);
-
   pendingClients.set(ws, timeout);
 }
 
@@ -42,15 +43,12 @@ export async function handleMessage(
     msg = JSON.parse(raw as string) as Record<string, unknown>;
   } catch {
     ws.send(
-      JSON.stringify({
-        type: "error",
-        message: "Invalid JSON",
-      } satisfies ServerMessage)
+      JSON.stringify({ type: "error", message: "Invalid JSON" } satisfies ServerMessage)
     );
     return;
   }
 
-  // ── Auth handshake — must be the first message ──
+  // ── Auth handshake ──
   if (pendingClients.has(ws)) {
     if (msg.type !== "auth") {
       ws.close(4002, "First message must be auth");
@@ -72,23 +70,28 @@ export async function handleMessage(
     clients.set(user.id, ws);
 
     console.log(`+ authenticated userId=${user.id}. Online: ${clients.size}`);
-
     ws.send(JSON.stringify({ type: "auth_ok" } satisfies ServerMessage));
     return;
   }
 
-  // ── Authenticated message handling ──
   const { userId } = ws.data;
   const clientMsg = msg as unknown as ClientMessage;
 
+  // ── join_room ──
   if (clientMsg.type === "join_room") {
     const { roomId } = clientMsg;
     await joinRoomById(roomId, userId);
     addToRoom(roomId, userId);
+    await subscribeToRoom(roomId);
+
+    // Clear unread count when user opens a room
+    await clearUnread(userId, roomId);
+
     console.log(`  userId=${userId} joined roomId=${roomId}`);
     return;
   }
 
+  // ── send_message ──
   if (clientMsg.type === "send_message") {
     const { roomId, content } = clientMsg;
     if (!content?.trim()) return;
@@ -97,7 +100,14 @@ export async function handleMessage(
     const user = await findUserById(userId);
     if (!user) return;
 
-    broadcastToRoom(roomId, {
+    // Get all room members to increment their unread counts
+    const memberIds = await getRoomMemberIds(roomId);
+
+    // Increment unread counts for all members except sender
+    // Run in parallel with the broadcast — no need to await
+    incrementUnreadForRoom(roomId, userId, memberIds).catch(console.error);
+
+    await broadcastToRoom(roomId, {
       type: "new_message",
       message: {
         id: messageId,
@@ -112,12 +122,17 @@ export async function handleMessage(
     return;
   }
 
+  // ── mark_read ──
   if (clientMsg.type === "mark_read") {
     const { roomId, lastMessageId } = clientMsg;
     if (!lastMessageId) return;
 
     const seenBy = await markMessagesRead(userId, roomId, lastMessageId);
-    broadcastToRoom(roomId, {
+
+    // Also clear Redis unread count
+    await clearUnread(userId, roomId);
+
+    await broadcastToRoom(roomId, {
       type: "seen_update",
       messageId: lastMessageId,
       seenBy,
@@ -126,9 +141,7 @@ export async function handleMessage(
   }
 }
 
-export function handleClose(
-  ws: ServerWebSocket<{ userId: string }>
-): void {
+export function handleClose(ws: ServerWebSocket<{ userId: string }>): void {
   const timeout = pendingClients.get(ws);
   if (timeout) {
     clearTimeout(timeout);

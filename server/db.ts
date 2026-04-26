@@ -54,15 +54,13 @@ export async function searchUsersByUsername(
 
 // ── Rooms ──
 
-export async function getAllRoomsForUser(userId: string): Promise<RoomPayload[]> {
-  // Only return rooms the user is a member of
+export async function getAllRoomsForUser(userId: string): Promise<Omit<RoomPayload, 'unreadCount'>[]> {
   const rows = await sql`
     SELECT
       r.id,
       r.name,
-      r.invite_code  AS "inviteCode",
-      r.created_at   AS "createdAt",
-      -- is this user the creator (first member joined)?
+      r.invite_code AS "inviteCode",
+      r.created_at  AS "createdAt",
       EXISTS (
         SELECT 1 FROM room_members rm2
         WHERE rm2.room_id = r.id
@@ -70,25 +68,20 @@ export async function getAllRoomsForUser(userId: string): Promise<RoomPayload[]>
           AND rm2.joined_at = (
             SELECT MIN(joined_at) FROM room_members WHERE room_id = r.id
           )
-      ) AS "isOwner",
-      COUNT(m.id) FILTER (
-        WHERE m.id NOT IN (
-          SELECT message_id FROM message_reads WHERE user_id = ${userId}
-        )
-        AND m.sender_id != ${userId}
-      ) AS "unreadCount"
+      ) AS "isOwner"
     FROM rooms r
     INNER JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = ${userId}
-    LEFT JOIN messages m ON m.room_id = r.id
     GROUP BY r.id
     ORDER BY r.created_at ASC
   `;
-  return rows.map((r: any) => ({
-    ...r,
-    unreadCount: Number(r.unreadCount),
-  })) as RoomPayload[];
+  return rows as Omit<RoomPayload, 'unreadCount'>[];
 }
-
+export async function getRoomMemberIds(roomId: string): Promise<string[]> {
+  const rows = await sql`
+    SELECT user_id FROM room_members WHERE room_id = ${roomId}
+  `;
+  return rows.map((r: any) => r.user_id);
+}
 export async function createRoom(
   name: string,
   creatorId: string
@@ -301,8 +294,11 @@ export async function saveMessage(
 
 export async function getMessagesByRoom(
   roomId: string,
-  limit = 50
-): Promise<MessagePayload[]> {
+  limit = 50,
+  // Cursor is the created_at timestamp of the oldest message the client has.
+  // Null means first load — return the most recent messages.
+  beforeCursor?: string
+): Promise<{ messages: MessagePayload[]; nextCursor: string | null }> {
   const rows = await sql`
     SELECT
       m.id,
@@ -320,11 +316,30 @@ export async function getMessagesByRoom(
     LEFT JOIN message_reads mr ON mr.message_id = m.id
     LEFT JOIN users u2 ON u2.id = mr.user_id
     WHERE m.room_id = ${roomId}
-    GROUP BY m.id, u.username
-    ORDER BY m.created_at ASC
-    LIMIT ${limit}
+      ${beforeCursor
+        ? sql`AND m.created_at < ${beforeCursor}::timestamptz`
+        : sql``
+      }
+    GROUP BY m.id, u.username, m.created_at
+    ORDER BY m.created_at DESC
+    LIMIT ${limit + 1}
   `;
-  return rows as MessagePayload[];
+
+  const all = rows as MessagePayload[];
+
+// If we got limit+1 rows there are more pages
+const hasMore = all.length > limit;
+const messages = hasMore ? all.slice(0, limit) : all;
+
+// Return in ascending order so the UI renders oldest → newest
+messages.reverse();
+
+// The cursor is the oldest message's timestamp (first after reverse)
+// We check messages[0] explicitly to satisfy TypeScript
+const oldestMessage = messages[0];
+const nextCursor = hasMore && oldestMessage ? oldestMessage.createdAt : null;
+
+return { messages, nextCursor };
 }
 
 export async function markMessagesRead(
